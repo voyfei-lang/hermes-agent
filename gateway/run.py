@@ -1927,6 +1927,7 @@ if _config_path.exists():
                 "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
                 "docker_env": "TERMINAL_DOCKER_ENV",
                 "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+                "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
                 "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
                 "docker_network": "TERMINAL_DOCKER_NETWORK",
                 "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
@@ -5338,8 +5339,17 @@ class TurnRunner:
                         title,
                     )
                 elif self._runner._is_discord_auto_thread_lane(ctx.source) or (
-                    self._runner._relay_auto_thread_info(ctx.source) is not None
+                    self._runner._is_relay_discord_channel_lane(ctx.source)
                 ):
+                    # Relay note: the second predicate is shape-only (relay
+                    # Discord channel event). Whether the connector actually
+                    # auto-threaded our reply is only knowable AFTER delivery
+                    # (send-result feedback), which on the non-streaming lane
+                    # happens after this registration runs — so the callback
+                    # must be registered eagerly and the rename lane performs
+                    # the cache lookup at fire time (staging repro 2026-07-31:
+                    # gating registration on the cache read meant it never
+                    # registered and no thread_rename op was ever sent).
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
                         ctx.source,
                         effective_session_id,
@@ -10992,9 +11002,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
+        # Start background kanban notifier — each gateway delivers events for
+        # subscriptions owned by the profiles whose adapters it hosts, even
+        # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
@@ -13508,7 +13518,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
-                adapter._pending_messages[quick_key] = queued_event
+                self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -13531,7 +13541,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
-            adapter._pending_messages[quick_key] = queued_event
+            self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -18813,6 +18823,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and bool(getattr(source, "auto_thread_initial_name", None))
         )
 
+    def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:
+        """Shape-only check: a relay-delivered Discord CHANNEL event whose
+        reply the connector MAY auto-thread (title-turn registration gate).
+
+        Deliberately does NOT consult the send-result cache: at registration
+        time (before delivery) the feedback can't exist yet. The rename lane
+        polls the cache at fire time instead."""
+        return (
+            source.platform == Platform.DISCORD
+            and bool(source.chat_id)
+            and not source.thread_id
+            and source.chat_type in ("group", "channel")
+            and getattr(source, "delivered_via_upstream_relay", False) is True
+        )
+
     def _relay_auto_thread_info(
         self, source: SessionSource
     ) -> Optional[Tuple[str, str]]:
@@ -18882,7 +18907,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if relay_info is None and not await asyncio.to_thread(
             self._is_discord_auto_thread_lane, source
         ):
-            return
+            # Relay title turn with no feedback captured at schedule time:
+            # the auto-title thread races the delivery that produces the
+            # connector's send-result feedback (thread_id + initial name).
+            # Poll the adapter cache briefly before giving up — delivery is
+            # typically milliseconds-to-seconds behind the title.
+            if not self._is_relay_discord_channel_lane(source):
+                return
+            for _ in range(20):  # up to ~10s
+                relay_info = self._relay_auto_thread_info(source)
+                if relay_info is not None:
+                    break
+                await asyncio.sleep(0.5)
+            if relay_info is None:
+                # True miss: the connector did not auto-thread this reply
+                # (policy off, DM, already-threaded, or send failed).
+                return
         adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
         if adapter is None:
             return
@@ -18918,9 +18958,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._is_discord_auto_thread_lane(source):
             # Relay title turn: the source is the PARENT channel event (the
             # thread didn't exist at ingest, so no auto-thread markers). The
-            # connector's send-result feedback tells us where the reply landed.
+            # connector's send-result feedback tells us where the reply
+            # landed — but the auto-title thread races the delivery that
+            # produces it, so a cache miss HERE is not a verdict. Schedule
+            # whenever the SHAPE matches; the async rename lane polls the
+            # cache (with a bounded wait) and no-ops on a true miss.
             relay_info = self._relay_auto_thread_info(source)
-            if relay_info is None:
+            if relay_info is None and not self._is_relay_discord_channel_lane(
+                source
+            ):
                 return
         try:
             loop = asyncio.get_running_loop()
@@ -19450,30 +19496,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _on_confirm(choice: str):
             if choice == "cancel":
                 return f"🟡 /{command} cancelled. Conversation unchanged."
+            persisted = False
             if choice == "always":
                 try:
                     from cli import save_config_value
-                    save_config_value("approvals.destructive_slash_confirm", False)
-                    logger.info(
-                        "User opted out of destructive slash confirm (session=%s)",
-                        session_key,
+                    # save_config_value swallows its own errors and reports the
+                    # outcome in the return value, so the try block alone says
+                    # nothing about whether the write landed.
+                    persisted = bool(
+                        save_config_value("approvals.destructive_slash_confirm", False)
                     )
+                    if persisted:
+                        logger.info(
+                            "User opted out of destructive slash confirm (session=%s)",
+                            session_key,
+                        )
+                    else:
+                        logger.warning(
+                            "Could not persist destructive_slash_confirm=false "
+                            "(session=%s); config.yaml is not writable",
+                            session_key,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Failed to persist destructive_slash_confirm=false: %s", exc,
                     )
             result = await execute()
             if choice == "always":
-                note = (
-                    "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
-                    "without confirmation. Re-enable via "
-                    "`approvals.destructive_slash_confirm: true` in config.yaml."
-                )
+                if persisted:
+                    note = (
+                        "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
+                        "without confirmation. Re-enable via "
+                        "`approvals.destructive_slash_confirm: true` in config.yaml."
+                    )
+                else:
+                    # The user did approve this run, so the action still goes
+                    # ahead, but the preference did not stick and the prompt
+                    # will be back next time. Say so rather than promising an
+                    # opt-out that was never written.
+                    note = (
+                        "\n\n⚠️ Could not save that preference (config.yaml is not "
+                        "writable), so /clear, /new, /reset, and /undo will ask "
+                        "again next time. To silence it permanently, set "
+                        "`approvals.destructive_slash_confirm: false` in config.yaml."
+                    )
                 if isinstance(result, str):
                     return result + note
-                # EphemeralReply or other — leave untouched; the opt-out note
-                # would otherwise mangle structured replies.  The persist itself
-                # already happened above; user gets the same UX next time.
+                # EphemeralReply or other: leave untouched, since the note would
+                # mangle structured replies.
                 return result
             return result
 
