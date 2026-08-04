@@ -5710,7 +5710,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         return _run_npm_install_deterministic(
             npm,
             npm_cwd,
-            extra_args=(*npm_workspace_args, "--silent") if silent else npm_workspace_args,
+            extra_args=(*npm_workspace_args, "--silent", "--prefer-offline") if silent else (*npm_workspace_args, "--prefer-offline"),
             env=build_env,
         )
 
@@ -12157,6 +12157,33 @@ def main():
     sessions_subparsers.add_parser(
         "optimize",
         help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",
+    )
+
+    sessions_clean_markers = sessions_subparsers.add_parser(
+        "clean-markers",
+        help="Permanently clear stale tool-call marker content left by sessions from before #78148",
+        description=(
+            "Before the #78148 fix, a local tool-call template could persist a "
+            "bare bracketed marker (e.g. \"[memory]\") as an assistant turn's "
+            "content instead of real text. This is already repaired in memory "
+            "on every session load, so running this is optional — it rewrites "
+            "the affected rows once, in place, so long-lived sessions stop "
+            "re-scanning/re-repairing the same rows on every resume. Only the "
+            "content column is touched; tool_calls and every other column on "
+            "the row are left untouched."
+        ),
+    )
+    sessions_clean_markers.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Report the affected row count without writing",
+    )
+    sessions_clean_markers.add_argument(
+        "--no-backup",
+        action="store_true",
+        default=False,
+        help="Skip the timestamped state.db backup taken before writing (not recommended)",
     )
 
     sessions_optimize_storage = sessions_subparsers.add_parser(
